@@ -42,12 +42,33 @@ def parse_filters(filters_str):
             filters[item.strip()] = True
     return filters
 
+def clean_text(text):
+    if not text:
+        return ""
+    text = text.replace("\n", " ").replace("\r", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+def parse_address(address_str):
+    """Sépare l'adresse en rue, code postal, ville"""
+    result = {"rue": "", "code_postal": "", "ville": ""}
+    if not address_str:
+        return result
+    match = re.search(r"(\d{5})", address_str)
+    if match:
+        result["code_postal"] = match.group(1)
+        parts = address_str.split(match.group(1))
+        result["rue"] = clean_text(parts[0])
+        result["ville"] = clean_text(parts[1]) if len(parts) > 1 else ""
+    else:
+        result["rue"] = clean_text(address_str)
+    return result
+
 def extract_doctor_info_from_list(doctor_element):
-    """Extrait les infos principales d’un médecin depuis la liste de résultats"""
     info = {}
     try:
         name_element = doctor_element.find_element(By.CSS_SELECTOR, "h2")
-        info['nom'] = name_element.text.strip()
+        info['nom'] = clean_text(name_element.text)
     except NoSuchElementException:
         info['nom'] = "Nom non trouvé"
 
@@ -55,7 +76,7 @@ def extract_doctor_info_from_list(doctor_element):
         specialty_element = doctor_element.find_element(By.CSS_SELECTOR, "p[data-design-system-component='Paragraph']")
         specialty_text = specialty_element.text.strip()
         if specialty_text and not any(word in specialty_text.lower() for word in ['rue', 'avenue', 'boulevard', 'km', 'conventionné']):
-            info['specialite'] = specialty_text
+            info['specialite'] = clean_text(specialty_text)
         else:
             info['specialite'] = args.query
     except NoSuchElementException:
@@ -65,40 +86,65 @@ def extract_doctor_info_from_list(doctor_element):
         paragraphs = doctor_element.find_elements(By.CSS_SELECTOR, "p")
         address_parts = []
         for p in paragraphs:
-            text = p.text.strip()
+            text = clean_text(p.text)
             if text and (re.search(r'\d{5}', text) or any(w in text.lower() for w in ['rue', 'avenue', 'boulevard', 'place'])):
                 if text not in address_parts:
                     address_parts.append(text)
-        info['adresse'] = ", ".join(address_parts[:2]) if address_parts else "Adresse non trouvée"
+        info['adresse'] = ", ".join(address_parts[:2]) if address_parts else ""
     except Exception:
-        info['adresse'] = "Erreur d'extraction"
+        info['adresse'] = ""
 
     try:
         distance_element = doctor_element.find_element(By.XPATH, ".//*[contains(text(), 'km') or contains(text(), 'm')]")
-        info['distance'] = distance_element.text.strip()
+        info['distance'] = clean_text(distance_element.text)
     except NoSuchElementException:
-        info['distance'] = "Distance non trouvée"
+        info['distance'] = ""
 
     try:
         conv_elements = doctor_element.find_elements(By.XPATH, ".//*[contains(text(), 'Conventionné') or contains(text(), 'conventionné')]")
-        info['conventionnement'] = conv_elements[0].text.strip() if conv_elements else "Non spécifié"
+        info['conventionnement'] = conv_elements[0].text.strip() if conv_elements else ""
     except Exception:
-        info['conventionnement'] = "Non spécifié"
+        info['conventionnement'] = ""
 
     try:
         rating_element = doctor_element.find_element(By.CSS_SELECTOR, "[data-test-id='review-summary-rating']")
         info['note'] = rating_element.text.strip()
     except NoSuchElementException:
-        info['note'] = "Non renseignée"
+        info['note'] = ""
 
     try:
         link = doctor_element.find_element(By.CSS_SELECTOR, "a[href*='/doctor'], a[href*='/medecin']")
         info['lien_profil'] = link.get_attribute("href")
     except NoSuchElementException:
-        info['lien_profil'] = "Lien non trouvé"
+        info['lien_profil'] = ""
 
     return info
-    
+
+def normalize_doctor_info(info):
+    info['nom'] = clean_text(info.get('nom', ''))
+    info['specialite'] = clean_text(info.get('specialite', args.query))
+
+    addr = parse_address(info.get('adresse', ''))
+    info['rue'] = addr['rue']
+    info['code_postal'] = addr['code_postal']
+    info['ville'] = addr['ville']
+    del info['adresse']
+
+    note = info.get('note', '').replace(',', '.')
+    info['note'] = float(note) if re.match(r'^\d+(\.\d+)?$', note) else None
+
+    info['conventionne'] = True if 'conventionné' in info.get('conventionnement', '').lower() else False
+    del info['conventionnement']
+
+    slots = info.get('creneaux_disponibles', '')
+    info['creneaux_disponibles'] = "; ".join([clean_text(s) for s in slots.split(';')]) if slots else ""
+    info['nb_creneaux'] = int(info.get('nb_creneaux', 0))
+
+    info['tarifs_remboursement'] = clean_text(info.get('tarifs_remboursement', 'Non renseigné'))
+    info['moyens_paiement'] = clean_text(info.get('moyens_paiement', 'Non renseigné'))
+    info['expertises_actes'] = clean_text(info.get('expertises_actes', 'Non renseigné'))
+
+    return info
 
 # --- Selenium setup ---
 options = Options()
@@ -121,7 +167,7 @@ try:
 
     driver.get("https://www.doctolib.fr/")
 
-    # --- Rejeter cookies si présent ---
+    # --- Rejeter cookies ---
     try:
         reject_btn = wait.until(EC.element_to_be_clickable((By.ID, "didomi-notice-disagree-button")))
         reject_btn.click()
@@ -174,63 +220,59 @@ try:
         doctor_info = extract_doctor_info_from_list(card)
         doctor_info['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # --- Cliquer sur tous les boutons "Voir plus" dans la carte ---
+        # Cliquer sur "Voir plus"
         try:
             while True:
                 try:
                     voir_plus_btn = card.find_element(By.XPATH, ".//button[contains(., 'Voir plus')]")
                     driver.execute_script("arguments[0].click();", voir_plus_btn)
-                    print("Bouton 'Voir plus' cliqué")
                     time.sleep(1)
                 except NoSuchElementException:
                     break
         except Exception as e:
             print(f"Erreur clic 'Voir plus': {e}")
 
-        # --- Récupération des créneaux ---
+        # Créneaux disponibles
         try:
             available_slots = []
             slot_elements = card.find_elements(By.CSS_SELECTOR,
                 "button[data-test-id*='slot'], .dl-booking-slot, .available-slot, .slot-time, .calendar-slot")
             for slot in slot_elements:
-                slot_text = slot.text.strip()
+                slot_text = clean_text(slot.text)
                 if slot_text and slot_text not in available_slots:
                     available_slots.append(slot_text)
-            doctor_info['creneaux_disponibles'] = '; '.join(available_slots) if available_slots else "Aucun créneau"
+            doctor_info['creneaux_disponibles'] = '; '.join(available_slots) if available_slots else ""
             doctor_info['nb_creneaux'] = len(available_slots)
         except Exception:
-            doctor_info['creneaux_disponibles'] = "Erreur"
-            doctor_info['nb_creneaux'] = -1
+            doctor_info['creneaux_disponibles'] = ""
+            doctor_info['nb_creneaux'] = 0
 
-        # --- Aller sur le profil du médecin pour récupérer les détails ---
-        profile_link = doctor_info.get('lien_profil')
-        if profile_link and profile_link != "Lien non trouvé":
+        # Profil médecin
+        profile_link = doctor_info.get('lien_profil', '')
+        if profile_link:
             try:
                 driver.execute_script("window.open(arguments[0], '_blank');", profile_link)
                 driver.switch_to.window(driver.window_handles[-1])
-                time.sleep(3)  # attendre que le profil charge
+                time.sleep(3)
 
-                # --- Tarifs et remboursement ---
                 try:
                     tarif_section = driver.find_element(By.CSS_SELECTOR, "#payment_means .dl-profile-text")
-                    doctor_info['tarifs_remboursement'] = tarif_section.text.strip()
+                    doctor_info['tarifs_remboursement'] = clean_text(tarif_section.text)
                 except NoSuchElementException:
-                    doctor_info['tarifs_remboursement'] = "Non renseigné"
+                    doctor_info['tarifs_remboursement'] = ""
 
-                # --- Moyens de paiement ---
                 try:
                     payment_section = driver.find_element(By.CSS_SELECTOR, "#payment_means ~ div .dl-profile-text")
-                    doctor_info['moyens_paiement'] = payment_section.text.strip()
+                    doctor_info['moyens_paiement'] = clean_text(payment_section.text)
                 except NoSuchElementException:
-                    doctor_info['moyens_paiement'] = "Non renseigné"
+                    doctor_info['moyens_paiement'] = ""
 
-                # --- Expertises et actes ---
                 try:
                     skills_section = driver.find_element(By.CSS_SELECTOR, "#skills .dl-profile-skills")
                     skills = [s.text for s in skills_section.find_elements(By.CSS_SELECTOR, ".dl-profile-skill-chip")]
-                    doctor_info['expertises_actes'] = "; ".join(skills) if skills else "Non renseigné"
+                    doctor_info['expertises_actes'] = "; ".join([clean_text(s) for s in skills]) if skills else ""
                 except NoSuchElementException:
-                    doctor_info['expertises_actes'] = "Non renseigné"
+                    doctor_info['expertises_actes'] = ""
 
                 driver.close()
                 driver.switch_to.window(driver.window_handles[0])
@@ -239,6 +281,8 @@ try:
                 driver.close()
                 driver.switch_to.window(driver.window_handles[0])
 
+        # Normaliser les données
+        doctor_info = normalize_doctor_info(doctor_info)
         doctors_data.append(doctor_info)
         print(f"✅ Médecin traité: {doctor_info.get('nom', 'Nom inconnu')}")
 
@@ -248,10 +292,9 @@ finally:
         csv_filename = args.output
         with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = [
-                'nom', 'specialite', 'adresse', 'note', 'distance',
-                'lien_profil', 'conventionnement', 'creneaux_disponibles',
-                'nb_creneaux', 'tarifs_remboursement', 'moyens_paiement', 'expertises_actes',
-                'timestamp'
+                'nom', 'specialite', 'rue', 'code_postal', 'ville', 'note', 'distance',
+                'lien_profil', 'conventionne', 'creneaux_disponibles', 'nb_creneaux',
+                'tarifs_remboursement', 'moyens_paiement', 'expertises_actes', 'timestamp'
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
