@@ -98,6 +98,7 @@ def extract_doctor_info_from_list(doctor_element):
         info['lien_profil'] = "Lien non trouvé"
 
     return info
+    
 
 # --- Selenium setup ---
 options = Options()
@@ -161,53 +162,82 @@ try:
     except Exception as e:
         print(f"Erreur pendant le scroll: {e}")
 
-    # --- Récupérer plusieurs médecins ---
-    all_doctors = driver.find_elements(By.CSS_SELECTOR, "[data-test-id*='result'], [data-testid*='result'], .dl-search-result, .doctor-card, .practitioner-card")
-    if not all_doctors:
-        all_doctors = driver.find_elements(By.CSS_SELECTOR, "a[href*='/doctor'], a[href*='/medecin']")
+    # --- Récupérer toutes les cartes des médecins ---
+    doctor_cards = driver.find_elements(By.CSS_SELECTOR,
+        "#main-content > div.flex.flex-1.flex-grow.flex-col.items-center > div > div.max-w-7xl > div.flex.gap-16.flex-col.w-full > div")
 
-    doctors_count = min(len(all_doctors), args.max_results)
+    doctors_count = min(len(doctor_cards), args.max_results)
     print(f"Analyse de {doctors_count} médecins...")
 
-    for i in range(doctors_count):
-        print(f"\nMédecin {i+1}/{doctors_count}")
-        # Relocaliser la liste pour éviter "stale element reference"
-        all_doctors = driver.find_elements(By.CSS_SELECTOR, "[data-test-id*='result'], [data-testid*='result'], .dl-search-result, .doctor-card, .practitioner-card")
-        doctor = all_doctors[i]
-
-        doctor_info = extract_doctor_info_from_list(doctor)
+    for i, card in enumerate(doctor_cards[:doctors_count], 1):
+        print(f"\nMédecin {i}/{doctors_count}")
+        doctor_info = extract_doctor_info_from_list(card)
         doctor_info['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # --- Cliquer sur tous les boutons "Voir plus" dans la carte ---
         try:
             while True:
                 try:
-                    voir_plus_btn = doctor.find_element(By.XPATH, ".//button[contains(., 'Voir plus')]")
+                    voir_plus_btn = card.find_element(By.XPATH, ".//button[contains(., 'Voir plus')]")
                     driver.execute_script("arguments[0].click();", voir_plus_btn)
                     print("Bouton 'Voir plus' cliqué")
-                    time.sleep(2)
+                    time.sleep(1)
                 except NoSuchElementException:
                     break
-                except Exception as e:
-                    print(f"Erreur lors du clic sur 'Voir plus': {e}")
-                    break
-
-            # --- Récupération des créneaux depuis la carte ---
-            available_slots = []
-            slot_elements = doctor.find_elements(By.CSS_SELECTOR, "button[data-test-id*='slot'], .dl-booking-slot, .available-slot, .slot-time, .calendar-slot")
-            for slot in slot_elements[:10]:
-                slot_text = slot.text.strip()
-                if slot_text and re.search(r'\d{1,2}[h:]\d{0,2}', slot_text):
-                    if slot_text not in available_slots:
-                        available_slots.append(slot_text)
-
-            doctor_info['creneaux_disponibles'] = '; '.join(available_slots) if available_slots else "Aucun créneau visible"
-            doctor_info['nb_creneaux'] = len(available_slots)
-
         except Exception as e:
-            print(f"Erreur récupération créneaux: {e}")
+            print(f"Erreur clic 'Voir plus': {e}")
+
+        # --- Récupération des créneaux ---
+        try:
+            available_slots = []
+            slot_elements = card.find_elements(By.CSS_SELECTOR,
+                "button[data-test-id*='slot'], .dl-booking-slot, .available-slot, .slot-time, .calendar-slot")
+            for slot in slot_elements:
+                slot_text = slot.text.strip()
+                if slot_text and slot_text not in available_slots:
+                    available_slots.append(slot_text)
+            doctor_info['creneaux_disponibles'] = '; '.join(available_slots) if available_slots else "Aucun créneau"
+            doctor_info['nb_creneaux'] = len(available_slots)
+        except Exception:
             doctor_info['creneaux_disponibles'] = "Erreur"
             doctor_info['nb_creneaux'] = -1
+
+        # --- Aller sur le profil du médecin pour récupérer les détails ---
+        profile_link = doctor_info.get('lien_profil')
+        if profile_link and profile_link != "Lien non trouvé":
+            try:
+                driver.execute_script("window.open(arguments[0], '_blank');", profile_link)
+                driver.switch_to.window(driver.window_handles[-1])
+                time.sleep(3)  # attendre que le profil charge
+
+                # --- Tarifs et remboursement ---
+                try:
+                    tarif_section = driver.find_element(By.CSS_SELECTOR, "#payment_means .dl-profile-text")
+                    doctor_info['tarifs_remboursement'] = tarif_section.text.strip()
+                except NoSuchElementException:
+                    doctor_info['tarifs_remboursement'] = "Non renseigné"
+
+                # --- Moyens de paiement ---
+                try:
+                    payment_section = driver.find_element(By.CSS_SELECTOR, "#payment_means ~ div .dl-profile-text")
+                    doctor_info['moyens_paiement'] = payment_section.text.strip()
+                except NoSuchElementException:
+                    doctor_info['moyens_paiement'] = "Non renseigné"
+
+                # --- Expertises et actes ---
+                try:
+                    skills_section = driver.find_element(By.CSS_SELECTOR, "#skills .dl-profile-skills")
+                    skills = [s.text for s in skills_section.find_elements(By.CSS_SELECTOR, ".dl-profile-skill-chip")]
+                    doctor_info['expertises_actes'] = "; ".join(skills) if skills else "Non renseigné"
+                except NoSuchElementException:
+                    doctor_info['expertises_actes'] = "Non renseigné"
+
+                driver.close()
+                driver.switch_to.window(driver.window_handles[0])
+            except Exception as e:
+                print(f"Erreur récupération profil: {e}")
+                driver.close()
+                driver.switch_to.window(driver.window_handles[0])
 
         doctors_data.append(doctor_info)
         print(f"✅ Médecin traité: {doctor_info.get('nom', 'Nom inconnu')}")
@@ -220,7 +250,8 @@ finally:
             fieldnames = [
                 'nom', 'specialite', 'adresse', 'note', 'distance',
                 'lien_profil', 'conventionnement', 'creneaux_disponibles',
-                'nb_creneaux', 'timestamp'
+                'nb_creneaux', 'tarifs_remboursement', 'moyens_paiement', 'expertises_actes',
+                'timestamp'
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
